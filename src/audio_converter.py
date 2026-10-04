@@ -143,10 +143,19 @@ class AudioConverter:
                             continue
                         if encrypted_file:
                             try:
-                                data = decrypt_attachment(data, encrypted_file)
+                                key = encrypted_file["key"]["k"]
+                                sha256_hash = encrypted_file["hashes"]["sha256"]
+                                iv = encrypted_file["iv"]
+                                data = decrypt_attachment(
+                                    data,
+                                    key,
+                                    sha256_hash,
+                                    iv
+                                )
                             except Exception:
                                 logger.exception("Failed to decrypt attachment mxc=%s", mxc_url)
                                 return None
+
                         return data
                 except aiohttp.ClientError:
                     logger.exception("Download failed for %s", url)

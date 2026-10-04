@@ -7,7 +7,13 @@ import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from nio import AsyncClient, RoomMessageAudio, RoomMessageFile
+from nio import (
+    AsyncClient,
+    RoomMessageAudio,
+    RoomMessageFile,
+    RoomEncryptedAudio,
+    RoomEncryptedFile
+)
 
 from src.audio_converter import AudioConverter
 from src.config import Settings
@@ -45,7 +51,12 @@ class BotService:
     async def handle_audio_event(
         self,
         room: object,
-        event: RoomMessageAudio | RoomMessageFile,
+        event: (
+        RoomMessageAudio
+        | RoomMessageFile
+        | RoomEncryptedAudio
+        | RoomEncryptedFile
+    )
     ) -> None:
         """Full pipeline: download, convert, transcribe, reply."""
         ts = getattr(event, "server_timestamp", None)

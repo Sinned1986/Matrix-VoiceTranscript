@@ -13,6 +13,8 @@ from nio import (
     MegolmEvent,
     RoomMessageAudio,
     RoomMessageFile,
+    RoomEncryptedAudio,
+    RoomEncryptedFile,
     SyncResponse,
     UnknownEncryptedEvent,
 )
@@ -140,6 +142,8 @@ def register_matrix_callbacks(client: AsyncClient, service: BotService) -> None:
     client.add_response_callback(on_keys_query, KeysQueryResponse)
     client.add_event_callback(on_invite, InviteMemberEvent)
     client.add_event_callback(on_audio, RoomMessageAudio)
+    client.add_event_callback(on_audio, RoomEncryptedAudio)
     client.add_event_callback(on_file, RoomMessageFile)
+    client.add_event_callback(on_file, RoomEncryptedFile)
     client.add_event_callback(on_encrypted, MegolmEvent)
     client.add_event_callback(on_encrypted, UnknownEncryptedEvent)
