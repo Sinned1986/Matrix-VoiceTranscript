@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import contextlib
 import logging
 from collections import defaultdict
@@ -10,15 +12,27 @@ from nio import (
     JoinError,
     JoinResponse,
     KeysQueryResponse,
+    KeyVerificationCancel,
+    KeyVerificationEvent,
+    KeyVerificationKey,
+    KeyVerificationMac,
+    KeyVerificationStart,
+    LocalProtocolError,
     MegolmEvent,
     RoomMessageAudio,
     RoomMessageFile,
     RoomEncryptedAudio,
     RoomEncryptedFile,
     SyncResponse,
+    ToDeviceError,
+    ToDeviceMessage,
     UnknownEncryptedEvent,
+    UnknownToDeviceEvent
 )
+
 from nio.exceptions import EncryptionError, LocalProtocolError
+
+import os
 
 from src.bot_service import BotService
 
@@ -31,6 +45,9 @@ def _own_mxid(client: AsyncClient) -> str:
         return uid
     return (getattr(client, "user", "") or "").strip()
 
+
+verification_devices = {}
+verification_done_sent = set()
 
 def register_matrix_callbacks(client: AsyncClient, service: BotService) -> None:
     first_sync_done = False
@@ -138,6 +155,254 @@ def register_matrix_callbacks(client: AsyncClient, service: BotService) -> None:
         except Exception:
             logger.exception("Error handling file event room=%s", room.room_id)  # type: ignore[attr-defined]
 
+    async def on_key_verification(event):
+        # For this bot, only allow verification with another session
+        # belonging to the transcriptbot account itself.
+        if event.sender != client.user_id:
+            logger.warning(
+                "Ignoring SAS verification from another user: %s",
+                event.sender,
+            )
+            return
+
+        if isinstance(event, KeyVerificationStart):
+            logger.info(
+                "SAS verification started by %s, device=%s, tx=%s",
+                event.sender,
+                event.from_device,
+                event.transaction_id,
+            )
+
+            if "emoji" not in event.short_authentication_string:
+                logger.error("Other device does not support emoji SAS")
+                await client.cancel_key_verification(
+                    event.transaction_id,
+                    reject=False,
+                )
+                return
+
+            response = await client.accept_key_verification(
+                event.transaction_id
+            )
+
+            if isinstance(response, ToDeviceError):
+                logger.error(
+                    "accept_key_verification failed: %s",
+                    response,
+                )
+                return
+
+            sas = client.key_verifications[event.transaction_id]
+
+            response = await client.to_device(sas.share_key())
+
+            if isinstance(response, ToDeviceError):
+                logger.error(
+                    "Sending SAS key failed: %s",
+                    response,
+                )
+            verification_devices[event.transaction_id] = event.from_device
+
+        elif isinstance(event, KeyVerificationKey):
+            sas = client.key_verifications[event.transaction_id]
+
+            emoji = sas.get_emoji()
+
+            logger.warning("==========================================")
+            logger.warning("MATRIX SAS VERIFICATION")
+            logger.warning("Transaction: %s", event.transaction_id)
+
+            for symbol, name in emoji:
+                logger.warning("%s  %s", symbol, name)
+
+            logger.warning("")
+            logger.warning(
+                "If these emojis match Element, run:"
+            )
+            logger.warning(
+                "docker compose exec matrix-voice-transcript "
+                "touch /tmp/sas-confirm"
+            )
+            logger.warning("==========================================")
+
+            # Wait up to 2 minutes for manual confirmation.
+            for _ in range(120):
+                if os.path.exists("/tmp/sas-confirm"):
+                    os.unlink("/tmp/sas-confirm")
+
+                    logger.info("SAS emojis manually confirmed")
+
+                    response = await client.confirm_short_auth_string(
+                                       event.transaction_id
+                    )
+
+                    if isinstance(response, ToDeviceError):
+                        logger.error(
+                            "confirm_short_auth_string failed: %s",
+                            response,
+                        )
+
+                    return
+
+                await asyncio.sleep(1)
+
+            logger.warning("SAS verification timed out")
+
+            await client.cancel_key_verification(
+                event.transaction_id,
+                reject=False,
+            )
+
+        elif isinstance(event, KeyVerificationMac):
+            sas = client.key_verifications.get(event.transaction_id)
+
+            if sas is None:
+                logger.warning(
+                    "Received SAS MAC for unknown transaction %s",
+                    event.transaction_id,
+                )
+                return
+
+            try:
+                message = sas.get_mac()
+            except LocalProtocolError as exc:
+                logger.error("SAS protocol error: %s", exc)
+                return
+
+            response = await client.to_device(message)
+
+            if isinstance(response, ToDeviceError):
+                logger.error("Sending SAS MAC failed: %s", response)
+                return
+
+            logger.info(
+                "SAS verification finished: verified=%s devices=%s",
+                sas.verified,
+                sas.verified_devices,
+            )
+
+            if sas.verified:
+                other_device = verification_devices.get(event.transaction_id)
+
+                if not other_device:
+                    logger.error(
+                        "Cannot send verification done: no device known for tx=%s",
+                        event.transaction_id,
+                    )
+                    return
+
+                done = ToDeviceMessage(
+                    "m.key.verification.done",
+                    event.sender,
+                    other_device,
+                    {
+                        "transaction_id": event.transaction_id,
+                    },
+                )
+
+            response = await client.to_device(done)
+
+            if isinstance(response, ToDeviceError):
+                logger.error(
+                    "Sending m.key.verification.done failed: %s",
+                    response,
+                )
+                return
+
+            verification_done_sent.add(event.transaction_id)
+
+            logger.info(
+                "Sent m.key.verification.done tx=%s device=%s",
+                event.transaction_id,
+                other_device,
+            )
+        elif isinstance(event, KeyVerificationCancel):
+            logger.warning(
+                "SAS verification cancelled by %s: %s",
+                event.sender,
+                event.reason,
+            )
+
+    async def on_unknown_to_device(event):
+        if not isinstance(event, UnknownToDeviceEvent):
+            return
+
+        logger.info(
+            "Received to-device event type=%s sender=%s",
+            event.type,
+            event.sender,
+        )
+
+        if event.type == "m.key.verification.done":
+            content = event.source.get("content", {})
+            transaction_id = content.get("transaction_id")
+
+            logger.info(
+                "Received m.key.verification.done tx=%s",
+                transaction_id,
+            )
+
+            verification_devices.pop(transaction_id, None)
+            verification_done_sent.discard(transaction_id)
+            return
+
+        if event.type != "m.key.verification.request":
+            return
+
+        # Only allow another device belonging to this same bot account.
+        if event.sender != client.user_id:
+            logger.warning(
+                "Ignoring verification request from different user: %s",
+                event.sender,
+            )
+            return
+
+        content = event.source.get("content", {})
+
+        transaction_id = content.get("transaction_id")
+        from_device = content.get("from_device")
+        methods = content.get("methods", [])
+
+        verification_devices[transaction_id] = from_device
+
+        if not transaction_id or not from_device:
+            logger.warning(
+                "Malformed verification request: %r",
+                content,
+            )
+            return
+
+        if "m.sas.v1" not in methods:
+            logger.warning(
+                "Verification request does not support SAS: %r",
+                methods,
+            )
+            return
+
+        logger.warning(
+            "Accepting SAS verification request from device=%s tx=%s",
+            from_device,
+            transaction_id,
+        )
+
+        ready = ToDeviceMessage(
+            "m.key.verification.ready",
+            event.sender,
+            from_device,
+            {
+                "from_device": client.device_id,
+                "methods": ["m.sas.v1"],
+                "transaction_id": transaction_id,
+            },
+        )
+
+        response = await client.to_device(ready)
+
+        logger.info(
+            "Sent m.key.verification.ready: %s",
+            response,
+        )
+
     client.add_response_callback(on_first_sync, SyncResponse)
     client.add_response_callback(on_keys_query, KeysQueryResponse)
     client.add_event_callback(on_invite, InviteMemberEvent)
@@ -147,3 +412,12 @@ def register_matrix_callbacks(client: AsyncClient, service: BotService) -> None:
     client.add_event_callback(on_file, RoomEncryptedFile)
     client.add_event_callback(on_encrypted, MegolmEvent)
     client.add_event_callback(on_encrypted, UnknownEncryptedEvent)
+
+    client.add_to_device_callback(
+        on_unknown_to_device,
+        (UnknownToDeviceEvent,),
+    )
+    client.add_to_device_callback(
+        on_key_verification,
+        (KeyVerificationEvent,),
+    )
