@@ -36,6 +36,8 @@ import os
 
 from src.bot_service import BotService
 
+from src.nio_compat import patch_forwarded_media
+
 logger = logging.getLogger(__name__)
 
 
@@ -51,7 +53,8 @@ verification_done_sent = set()
 
 def register_matrix_callbacks(client: AsyncClient, service: BotService) -> None:
     first_sync_done = False
-
+    patch_forwarded_media()
+    
     def _trust_all_devices() -> None:
         # Auto-trust every device we learn about. The bot operates in untrusted
         # public rooms; refusing keys to unverified devices would block all decryption.
